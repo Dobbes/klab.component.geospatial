@@ -3,12 +3,13 @@ package org.integratedmodelling.geospatial.library;
 import com.bedatadriven.jackson.datatype.jts.JtsModule;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import it.geosolutions.imageio.plugins.tiff.BaselineTIFFTagSet;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBuffer;
 import java.io.*;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -20,7 +21,6 @@ import org.geotools.api.style.Style;
 import org.geotools.coverage.grid.GridCoverage2D;
 import org.geotools.data.shapefile.dbf.DbaseFileHeader;
 import org.geotools.data.shapefile.dbf.DbaseFileWriter;
-import org.geotools.gce.geotiff.GeoTiffWriter;
 import org.geotools.map.GridCoverageLayer;
 import org.geotools.map.MapContent;
 import org.geotools.renderer.lite.StreamingRenderer;
@@ -30,6 +30,7 @@ import org.integratedmodelling.common.logging.Logging;
 import org.integratedmodelling.geospatial.adapters.raster.*;
 import org.integratedmodelling.geospatial.utils.Geotools;
 import org.integratedmodelling.geospatial.utils.RasterRenderer;
+import org.integratedmodelling.geospatial.utils.NativeGeoTiffWriter;
 import org.integratedmodelling.klab.api.collections.Pair;
 import org.integratedmodelling.klab.api.collections.Parameters;
 import org.integratedmodelling.klab.api.data.*;
@@ -46,7 +47,6 @@ import org.integratedmodelling.klab.api.scope.ContextScope;
 import org.integratedmodelling.klab.api.services.resources.adapters.Exporter;
 import org.integratedmodelling.klab.api.services.runtime.extension.KlabFunction;
 import org.integratedmodelling.klab.api.services.runtime.extension.Library;
-import org.integratedmodelling.klab.api.services.runtime.extension.Reference;
 import org.integratedmodelling.klab.utilities.Utils;
 
 @Library(
@@ -298,14 +298,44 @@ public class GeodataIO {
       description = "Export a numeric observation to a raw data GeoTiff")
   public InputStream exportGeotiffContinuous(
       Observation observation, Storage.DoubleScanner scanner, ContextScope scope) {
+    File file = null;
     try {
-      var file = File.createTempFile("klab", ".tiff");
-      exportObservation(file, observation, scanner, "tiff", scope);
-      return new FileInputStream(file);
+      file = File.createTempFile("klab", ".tiff");
+      var exported = exportObservation(file, observation, scanner, "tiff", scope);
+      if (exported == null) throw new IOException("Numeric GeoTIFF export produced no file");
+      return deleteOnClose(new FileInputStream(exported), exported.toPath());
     } catch (IOException e) {
+      if (file != null) {
+        try { Files.deleteIfExists(file.toPath()); } catch (IOException cleanup) { e.addSuppressed(cleanup); }
+      }
       scope.error(e);
       throw new KlabIOException(e);
+    } catch (RuntimeException e) {
+      if (file != null) {
+        try { Files.deleteIfExists(file.toPath()); } catch (IOException cleanup) { e.addSuppressed(cleanup); }
+      }
+      throw e;
     }
+  }
+
+  static InputStream deleteOnClose(InputStream input, Path ownedFile) {
+    return new FilterInputStream(input) {
+      @Override public void close() throws IOException {
+        IOException failure = null;
+        try {
+          super.close();
+        } catch (IOException error) {
+          failure = error;
+        }
+        try {
+          Files.deleteIfExists(ownedFile);
+        } catch (IOException cleanup) {
+          if (failure == null) failure = cleanup;
+          else failure.addSuppressed(cleanup);
+        }
+        if (failure != null) throw failure;
+      }
+    };
   }
 
   @Exporter(
@@ -396,7 +426,7 @@ public class GeodataIO {
     }
   }
 
-  @Reference.Exporter(name = "geotiff") // TODO support this!
+  // Categorical export remains unregistered until its scanner/coverage implementation is supported.
   public InputStream exportGeotiffCategorical(
       Observation observation, Storage.KeyScanner scanner, DataKey dataKey, ContextScope scope) {
     try {
@@ -483,22 +513,28 @@ public class GeodataIO {
       //        // THIS SHOULD BE LOGGED THOUGH
       //      }
 
-      coverage =
-          Geotools.stateToCoverage(
-              observation, scanner, DataBuffer.TYPE_FLOAT, Float.NaN, scope, false);
+      var storageType = scanner.shard().getShardingStrategy().getDataType();
+      if (storageType == Storage.Type.LONG) {
+        throw new KlabIllegalArgumentException(
+            "Int64 GeoTIFF export requires an exact integer scanner contract; a DoubleScanner may lose integer precision");
+      }
+      // The public numeric exporter consumes doubles, including converted scanner
+      // views. Widen float inputs rather than narrowing a double-valued view.
+      coverage = Geotools.stateToCoverage(
+          observation, scanner, DataBuffer.TYPE_DOUBLE, Float.NaN, scope, false);
     }
 
     if (format.equalsIgnoreCase("tiff")) {
       try {
 
         File rasterFile = Utils.Files.changeExtension(out, "tiff");
-        GeoTiffWriter writer = new GeoTiffWriter(rasterFile);
-
-        writer.setMetadataValue(
-            Integer.toString(BaselineTIFFTagSet.TAG_SOFTWARE),
-            "k.LAB (www.integratedmodelling.org)");
-
-        writer.write(coverage, null);
+        var unit = observation.getObservable().getUnit();
+        if (unit != null && !(unit instanceof org.integratedmodelling.klab.api.data.mediation.impl.UnitImpl)) {
+          throw new KlabIllegalArgumentException("GeoTIFF requires a serializable source unit definition");
+        }
+        NativeGeoTiffWriter.write(rasterFile, coverage,
+            unit instanceof org.integratedmodelling.klab.api.data.mediation.impl.UnitImpl sourceUnit
+                ? sourceUnit.getDefinition() : null);
 
         if (dir != null && addStyle) {
           if (!doNotZip) {
@@ -517,7 +553,9 @@ public class GeodataIO {
         }
         return file;
       } catch (IOException e) {
-        return null;
+        throw new KlabIOException(e);
+      } finally {
+        if (coverage != null) coverage.dispose(true);
       }
     }
 

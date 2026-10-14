@@ -11,6 +11,7 @@ import org.geotools.api.referencing.crs.CoordinateReferenceSystem;
 import org.geotools.coverage.GridSampleDimension;
 import org.geotools.coverage.grid.GridCoverage2D;
 import org.geotools.coverage.grid.GridCoverageFactory;
+import org.geotools.coverage.util.CoverageUtilities;
 import org.geotools.geometry.jts.ReferencedEnvelope;
 import org.geotools.metadata.iso.citation.Citations;
 import org.geotools.referencing.CRS;
@@ -177,8 +178,7 @@ public class Geotools {
     /*
      * build a coverage.
      *
-     * TODO use a raster of the appropriate type - for now there is apparently a bug in geotools
-     * that makes it work only with float.
+     * Preserve the caller's requested raster representation.
      */
 
     WritableRaster raster =
@@ -289,15 +289,16 @@ public class Geotools {
     var grid = scale.getSpace().as(Tile.class).getGrid();
     var envelope = scale.getSpace().getEnvelope();
     var dataKey = scope.getDigitalTwin().getStorageManager().getStorage(state).getKey();
+    int width = Math.toIntExact(grid.getXCells());
+    int height = Math.toIntExact(grid.getYCells());
     /*
      * build a coverage.
      *
-     * TODO use a raster of the appropriate type - for now there is apparently a bug in geotools
-     * that makes it work only with float.
+     * Preserve the requested float or double representation.
      */
     WritableRaster raster =
         RasterFactory.createBandedRaster(
-            type, (int) grid.getXCells(), (int) grid.getYCells(), 1, null);
+            type, width, height, 1, null);
     /*
      * pre-fill with nodata (the thing is filled with 0s).
      */
@@ -324,15 +325,19 @@ public class Geotools {
     for (int i = 0; i < scanner.size(); i++) {
 
       var xy = mapper.offsets(i);
+      int column = Math.toIntExact(xy[0]);
+      // k.LAB grid y increases northward; image rows increase southward.
+      int row = height - 1 - Math.toIntExact(xy[1]);
 
       Object o = fetch(scanner);
-      if (o == null || (o instanceof Double && Double.isNaN((Double) o))) {
-        raster.setSample((int) xy[0], (int) xy[1], 0, noDataValue);
+      if (o == null || (o instanceof Number number && Double.isNaN(number.doubleValue()))) {
+        raster.setSample(column, row, 0, noDataValue);
       } else if (o instanceof Number) {
         if (transformation != null) {
           o = transformation.apply(o);
         }
-        float value = ((Number) o).floatValue();
+        double value = ((Number) o).doubleValue();
+        if (type == DataBuffer.TYPE_FLOAT) value = (float) value;
         if (Double.isNaN(min) || min > value) {
           min = value;
         }
@@ -340,19 +345,19 @@ public class Geotools {
           max = value;
         }
         ndata++;
-        raster.setSample((int) xy[0], (int) xy[1], 0, value);
+        raster.setSample(column, row, 0, value);
       } else if (o instanceof Boolean) {
         if (transformation != null) {
           o = transformation.apply(o);
         }
         ndata++;
-        raster.setSample((int) xy[0], (int) xy[1], 0, (float) (((Boolean) o) ? 1. : 0.));
+        raster.setSample(column, row, 0, (float) (((Boolean) o) ? 1. : 0.));
       } else if (o instanceof Concept) {
         if (transformation != null) {
           o = transformation.apply(o);
         }
         ndata++;
-        raster.setSample((int) xy[0], (int) xy[1], 0, (float) dataKey.reverseLookup((Concept) o));
+        raster.setSample(column, row, 0, (float) dataKey.reverseLookup((Concept) o));
       }
     }
 
@@ -400,17 +405,16 @@ public class Geotools {
     Map<String, Object> properties = new HashMap<>();
     properties.put("dataRange", new double[] {min, max});
     properties.put("dataCount", ndata);
+    CoverageUtilities.setNoDataProperty(properties, noDataValue.doubleValue());
 
     // System.out.println(state.getObservable().getReferenceName() + " raster has range " + min
     // + " to " + max + " (" + ndata + ")");
 
     var jtsEnvelope = checkEnvelope(envelope);
-    if (key == null || pork) {
-      return rasterFactory.create(state.getObservable().getName(), raster, jtsEnvelope);
-    }
-
-    return rasterFactory.create(
-        state.getObservable().getName(), raster, jtsEnvelope, new GridSampleDimension[] {key});
+    GridSampleDimension[] bands = key == null || pork ? null : new GridSampleDimension[] {key};
+    var base = rasterFactory.create(state.getObservable().getName(), raster, jtsEnvelope, bands);
+    return rasterFactory.create(state.getObservable().getName(), base.getRenderedImage(),
+        jtsEnvelope, base.getSampleDimensions(), null, properties);
   }
 
   private static Object fetch(Storage.Scanner scanner) {
